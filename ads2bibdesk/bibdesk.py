@@ -1,6 +1,7 @@
 import logging
 import subprocess
 import os
+import time
 
 import AppKit  # from pyobjc-framework-Cocoa
 app_info = AppKit.NSBundle.mainBundle().infoDictionary()
@@ -8,6 +9,7 @@ app_info["LSBackgroundOnly"] = 1
 
 logger = logging.getLogger(__name__)
 
+BIBDESK_PATH = "/System/Volumes/Data/Applications/TeX/BibDesk.app"
 
 class BibDesk(object):
 
@@ -15,8 +17,48 @@ class BibDesk(object):
         """
         Manage BibDesk publications using AppKit
         """
+        self.ensure_bibdesk_running()
         self.app = AppKit.NSAppleScript.alloc()
         self.refresh()
+
+    def ensure_bibdesk_running(self):
+        """
+        Ensure BibDesk is running and accessible
+        """
+        try:
+            # Check if BibDesk exists
+            if not os.path.exists(BIBDESK_PATH):
+                raise RuntimeError(f"BibDesk not found at {BIBDESK_PATH}")
+            
+            # Try to launch BibDesk if not running, with LSBackgroundOnly flag
+            launch_cmd = '''
+                tell application "System Events"
+                    set isRunning to (exists (processes where name is "BibDesk"))
+                    if not isRunning then
+                        tell application "BibDesk"
+                            launch
+                            set visible of every window to false
+                        end tell
+                    end if
+                end tell
+            '''
+            subprocess.run(['osascript', '-e', launch_cmd], check=True)
+            
+            # Give it a moment to start up
+            time.sleep(2)  # Increased delay
+            
+            # Verify BibDesk is running
+            verify_cmd = 'tell application "BibDesk" to return version'
+            result = subprocess.run(['osascript', '-e', verify_cmd], 
+                                   capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"Failed to verify BibDesk: {result.stderr}")
+                raise RuntimeError("BibDesk verification failed")
+            logger.debug(f"BibDesk version: {result.stdout.strip()}")
+            
+        except Exception as e:
+            logger.error(f"Failed to start BibDesk: {str(e)}")
+            raise
 
     def __call__(self, cmd, pid=None, strlist=False, error=False):
         """
@@ -26,32 +68,63 @@ class BibDesk(object):
         :param strlist: return output as list of string
         :param error: return full output of call, including error
         """
-        if pid is None:
-            # address all publications
-            cmd = 'tell first document of application "BibDesk" to {}'.format(
-                cmd)
-        else:
-            # address a single publication
-            cmd = 'tell first document of application "BibDesk" to '\
-                  'tell first publication whose id is "{}" to {}'.format(
-                      pid, cmd)
-        output = self.app.initWithSource_(cmd).executeAndReturnError_(None)
-        if not error:
-            output = output[0]
-            if strlist:
-                # objective C nuisances...
-                output = [output.descriptorAtIndex_(i + 1).stringValue()
-                          for i in range(output.numberOfItems())]
-        return output
+        try:
+            if pid is None:
+                # First try to create a document if none exists
+                init_cmd = 'tell application "BibDesk"\nif (count of documents) is 0 then\nmake new document\nend if\nend tell'
+                init_result = self.app.initWithSource_(init_cmd).executeAndReturnError_(None)
+                if init_result is None or init_result[0] is None:
+                    logger.error("Failed to initialize BibDesk document")
+                    raise RuntimeError("Failed to initialize BibDesk document")
+                
+                # Now execute the actual command
+                cmd = f'tell application "BibDesk"\ntell first document\n{cmd}\nend tell\nend tell'
+            else:
+                cmd = f'tell application "BibDesk"\ntell first document\ntell first publication whose id is "{pid}"\n{cmd}\nend tell\nend tell\nend tell'
+            
+            logger.debug(f"Executing AppleScript command: {cmd}")
+            output = self.app.initWithSource_(cmd).executeAndReturnError_(None)
+            
+            if output is None:
+                logger.error("AppleScript execution returned None")
+                raise RuntimeError("AppleScript execution failed")
+            
+            if len(output) < 1 or output[0] is None:
+                logger.error("AppleScript execution returned no result")
+                raise RuntimeError("AppleScript execution returned no result")
+            
+            if not error:
+                output = output[0]
+                if strlist:
+                    if output.numberOfItems() == 0:
+                        return []
+                    output = [output.descriptorAtIndex_(i + 1).stringValue()
+                              for i in range(output.numberOfItems())]
+            return output
+            
+        except Exception as e:
+            logger.error(f"AppleScript execution failed: {str(e)}")
+            raise
 
     def refresh(self):
-        # is there an opened document yet?
-        if self('return name of first document '
-                'of application "BibDesk"', error=True)[1] is not None:
-            # create blank one
-            self('tell application "BibDesk" to make new document')
-        self.titles = self('return title of publications', strlist=True)
-        self.ids = self('return id of publications', strlist=True)
+        """
+        Refresh the BibDesk document state
+        """
+        try:
+            # First ensure we have a document
+            init_cmd = 'tell application "BibDesk"\nif (count of documents) is 0 then\nmake new document\nend if\nend tell'
+            init_result = self.app.initWithSource_(init_cmd).executeAndReturnError_(None)
+            if init_result is None or init_result[0] is None:
+                logger.error("Failed to initialize BibDesk document")
+                raise RuntimeError("Failed to initialize BibDesk document")
+            
+            # Now get publications
+            self.titles = self('return title of publications', strlist=True)
+            self.ids = self('return id of publications', strlist=True)
+            
+        except Exception as e:
+            logger.error(f"Failed to refresh BibDesk state: {str(e)}")
+            raise
 
     def pid(self, title):
         return self.ids[self.titles.index(title)]

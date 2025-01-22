@@ -150,22 +150,7 @@ def process_article(args, prefs):
 def process_token(article_identifier, prefs, bibdesk):
     """
     Process a single article token from the user, adding it to BibDesk.
-
-    Parameters
-    ----------
-    article_identifier : str
-        Any user-supplied `str` token.
-    prefs : :class:`Preferences`
-        A `Preferences` instance.
-    bibdesk : :class:`BibDesk`
-        A `BibDesk` AppKit hook instance.
     """
-
-    """
-    print((prefs['default']['ads_token']))
-    print(article_identifier)
-    """
-
     if 'true' in prefs['options']['alert_sound'].lower():
         alert_sound = 'Frog'
     else:
@@ -173,10 +158,6 @@ def process_token(article_identifier, prefs, bibdesk):
 
     if 'dev_key' not in prefs['default']['ads_token']:
         ads.config.token = prefs['default']['ads_token']
-
-    #   field-id list:
-    #       https://github.com/adsabs/adsabs-dev-api/blob/master/Search_API.ipynb
-    #       https://adsabs.github.io/help/search/comprehensive-solr-term-list
 
     ads_query = ads.SearchQuery(identifier=article_identifier,
                                 fl=['author', 'first_author',
@@ -199,33 +180,9 @@ def process_token(article_identifier, prefs, bibdesk):
         logger.info("Found Zero or Multiple ADS antries for {}".format(
             article_identifier))
         logger.info("No update in BibDesk")
-
         return False
 
     ads_article = ads_articles[0]
-
-    use_bibtexabs = False
-    #   use "bibtex" by default
-    #   another option could be "bibtexabs":
-    #       https://github.com/andycasey/ads/pull/109
-    #   however, a change in ads() is required and the abstract field from the "bibtexabs" option doesn't
-    #   always comply with the tex syntax.
-    if use_bibtexabs == True:
-        ads_bibtex = ads.ExportQuery(
-            bibcodes=ads_article.bibcode, format='bibtexabs').execute()
-    else:
-        ads_bibtex = ads.ExportQuery(
-            bibcodes=ads_article.bibcode, format='bibtex').execute()
-
-    logger.debug(">>>API limits")
-    logger.debug("   {}".format(ads_query.response.get_ratelimits()))
-    logger.debug(">>>ads_bibtex")
-    logger.debug("   {}".format(ads_bibtex))
-
-    for k, v in ads_article.items():
-        logger.debug('>>>{}'.format(k))
-        logger.debug('   {}'.format(v))
-
     article_bibcode = ads_article.bibcode
     article_esources = ads_article.esources
 
@@ -234,35 +191,39 @@ def process_token(article_identifier, prefs, bibdesk):
                                                prefs=prefs)
     else:
         pdf_filename = '.null'
+        pdf_status = False
 
+    # Process BibTeX
+    use_bibtexabs = False
+    if use_bibtexabs == True:
+        ads_bibtex = ads.ExportQuery(
+            bibcodes=ads_article.bibcode, format='bibtexabs').execute()
+    else:
+        ads_bibtex = ads.ExportQuery(
+            bibcodes=ads_article.bibcode, format='bibtex').execute()
+
+    # Handle duplicates
     kept_pdfs = []
     kept_fields = {}
     kept_groups = []
-
     found = difflib.get_close_matches(
         ads_article.title[0], bibdesk.titles, n=1, cutoff=.7)
 
-    # first author is the same
     if len(found) > 0:
         if found and difflib.SequenceMatcher(
                 None,
                 bibdesk.authors(bibdesk.pid(found[0]))[0],
                 ads_article.author[0]).ratio() > .6:
-            # further comparison on abstract
             abstract = bibdesk('abstract', bibdesk.pid(found[0])).stringValue()
             if not abstract or difflib.SequenceMatcher(
                     None, abstract,
                     ads_article.abstract).ratio() > .6:
                 pid = bibdesk.pid(found[0])
                 kept_groups = bibdesk.get_groups(pid)
-                # keep all fields for later comparison
-                # (especially rating + read bool)
                 kept_fields = dict((k, v) for k, v in
                                    zip(bibdesk('return name of fields', pid, True),
                                        bibdesk('return value of fields', pid, True))
-                                   # Adscomment may be arXiv only
                                    if k != 'Adscomment')
-                # plus BibDesk annotation
                 kept_fields['BibDeskAnnotation'] = bibdesk(
                     'return its note', pid).stringValue()
 
@@ -273,20 +234,14 @@ def process_token(article_identifier, prefs, bibdesk):
                 logger.info(ads_article.title[0])
 
                 kept_pdfs += bibdesk.safe_delete(pid)
-
                 bibdesk.refresh()
 
-    # add new entry
+    # Add new entry
     ads_bibtex_clean = ads_bibtex.replace('\\', r'\\').replace('"', r'\"')
     pub = bibdesk(f'import from "{ads_bibtex_clean}"')
-
-    # pub id
     pub = pub.descriptorAtIndex_(1).descriptorAtIndex_(3).stringValue()
-
-    # automatic cite key
     bibdesk('set cite key to generated cite key', pub)
 
-    # abstract
     if ads_article.abstract is not None:
         ads_abstract_clean = ads_article.abstract.replace('\\', r'\\').replace(
             '"', r'\"').replace('}', ' ').replace('{', ' ')
@@ -294,35 +249,52 @@ def process_token(article_identifier, prefs, bibdesk):
 
     doi = bibdesk('value of field "doi"', pub).stringValue()
 
+    # Handle PDF and URLs
     if pdf_filename.endswith('.pdf') and pdf_status:
         # register PDF into BibDesk
         bibdesk(
             f'add POSIX file "{pdf_filename}" to beginning of linked files', pub)
-        # automatic file name
         bibdesk('auto file', pub)
-    elif 'http' in pdf_filename and not doi:
-        # URL for electronic version - only add it if no DOI link present
-        # (they are very probably the same)
-        bibdesk(
-            f'make new linked URL at end of linked URLs with data "{pdf_filename}"', pub)
+        notify('New publication added with PDF',
+               bibdesk('cite key', pub).stringValue(),
+               ads_article.title[0], alert_sound=alert_sound)
+    else:
+        # Add verification URL or DOI URL
+        if not pdf_status and pdf_filename.startswith('http'):
+            # This is a verification URL
+            bibdesk(
+                f'make new linked URL at end of linked URLs with data "{pdf_filename}"', pub)
+            notify('New publication added (PDF requires verification)',
+                   bibdesk('cite key', pub).stringValue(),
+                   f"{ads_article.title[0]} - Please verify at {pdf_filename}", alert_sound=alert_sound)
+        elif doi:
+            # Use DOI URL
+            doi_url = f"https://doi.org/{doi}"
+            bibdesk(
+                f'make new linked URL at end of linked URLs with data "{doi_url}"', pub)
+            notify('New publication added with DOI link',
+                   bibdesk('cite key', pub).stringValue(),
+                   ads_article.title[0], alert_sound=alert_sound)
+        else:
+            notify('New publication added (no PDF)',
+                   bibdesk('cite key', pub).stringValue(),
+                   ads_article.title[0], alert_sound=alert_sound)
 
-    # add URLs as linked URL if not there yet
+    # Add additional URLs
     urls = bibdesk('value of fields whose name ends with "url"',
                    pub, strlist=True)
     if 'EPRINT_HTML' in article_esources:
         urls += [get_esource_link(article_bibcode, esource_type='eprint_html')]
 
     urlspub = bibdesk('linked URLs', pub, strlist=True)
-
     for u in [u for u in urls if u not in urlspub]:
         bibdesk(
             f'make new linked URL at end of linked URLs with data "{u}"', pub)
 
-    # add old annotated files
+    # Add old annotated files and custom fields
     for kept_pdf in kept_pdfs:
         bibdesk(f'add POSIX file "{kept_pdf}" to end of linked files', pub)
 
-    # re-insert custom fields
     bibdesk_annotation = kept_fields.pop("BibDeskAnnotation", '')
     bibdesk(f'set its note to "{bibdesk_annotation}"', pub)
     newFields = bibdesk('return name of fields', pub, True)
@@ -330,110 +302,203 @@ def process_token(article_identifier, prefs, bibdesk):
         if k not in newFields:
             bibdesk(f'set value of field "{(k, v)}" to "{pub}"')
 
-    notify('New publication added',
-           bibdesk('cite key', pub).stringValue(),
-           ads_article.title[0], alert_sound=alert_sound)
+    # Add back static groups
+    if kept_groups:
+        new_groups = bibdesk.add_groups(pub, kept_groups)
+
     logger.info('New publication added:')
     logger.info(bibdesk('cite key', pub).stringValue())
     logger.info(ads_article.title[0])
-
-    # add back the static groups assignment
-    if kept_groups != []:
-        new_groups = bibdesk.add_groups(pub, kept_groups)
 
     return True
 
 
 def process_pdf(article_bibcode, article_esources,
                 prefs=None,
-                esource_types=['pub_pdf', 'pub_html', 'eprint_pdf', 'ads_pdf', 'author_pdf']):
+                esource_types=['ads_pdf', 'ads_scan', 'pub_pdf', 'pub_html']):
     """
     article_bibcode:    ADS bibcode
     article_esources:   esources available for this specific article
-        note: PUB_PDF is not always pointing to the actual PDF:
-            e.g. https://ui.adsabs.harvard.edu/abs/2015Sci...348..779H
-                so we will go through all esource_types x (local,proxy)
     esource_types:      the esource type order to try for PDF downloading
-                        if one prefer arxiv pdf, set it to:
-                            [eprint_pdf','pub_pdf','pub_html',ads_pdf']
-
+                        Default order prioritizes published versions:
+                        1. ads_pdf: ADS's PDF version (preferred)
+                        2. ads_scan: ADS's scanned version
+                        3. pub_pdf: Publisher's PDF version
+                        4. pub_html: Publisher's HTML version (to extract PDF)
+                        Note: eprint_pdf will only be tried if no published version exists
     """
-
     pdf_status = False
     pdf_filename = '.null'
+    verification_urls = []  # Store URLs that need verification
+    
+    # Create a requests session to maintain cookies
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/pdf,application/x-pdf,*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
 
+    # Check if published versions exist
+    has_published = any(source in article_esources for source in ['PUB_PDF', 'PUB_HTML', 'ADS_PDF', 'ADS_SCAN'])
+    
+    # If no published versions, add eprint_pdf to sources
+    if not has_published and 'EPRINT_PDF' in article_esources:
+        esource_types = list(esource_types) + ['eprint_pdf']
+
+    # Try each source in order
     for esource_type in esource_types:
-
-        # if esource_type is not available, we will not move forward.
-        # if pub_pdf is available, we will not use pub_html.
-
         if esource_type.upper() not in article_esources:
             continue
         
-        esource_url = get_esource_link(
-            article_bibcode, esource_type=esource_type)
-
-        if esource_type == 'pub_html':
-            logger.debug("try >>> {}".format(esource_url))
-            response = requests.get(esource_url, allow_redirects=True,
-                                    headers={'User-Agent':
-                                             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_5) AppleWebKit/537.36 \
-                                    (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'})
-            logger.debug("    >>> {}".format(response.url))
-            pdf_url = get_pdf_fromhtml(response)
-        else:
-            pdf_url = esource_url
-
-        logger.debug("try >>> {}".format(pdf_url))
-        response = requests.get(pdf_url, allow_redirects=True,
-                                headers={'User-Agent':
-                                         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_5) AppleWebKit/537.36 \
-                                (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'})
-
-        fd, pdf_filename = tempfile.mkstemp(suffix='.pdf')
-        if response.status_code != 404 and response.status_code != 403:
-            os.fdopen(fd, 'wb').write(response.content)
-
-        if 'PDF document' in get_filetype(pdf_filename):
-            pdf_status = True
-            logger.debug("try succeeded >>> {}".format(pdf_url))
-            break
-        else:
-            logger.debug("try failed >>> {}".format(pdf_url))
-
-        if 'pub' in esource_type and \
-                prefs['proxy']['ssh_user'] != 'None' and prefs['proxy']['ssh_server'] != 'None':
-            pdf_status = process_pdf_proxy(pdf_url, pdf_filename,
-                                           prefs['proxy']['ssh_user'],
-                                           prefs['proxy']['ssh_server'],
-                                           port=prefs['proxy']['ssh_port'])
-            if pdf_status == True:
+        esource_url = get_esource_link(article_bibcode, esource_type=esource_type)
+        logger.debug(f"Trying source: {esource_type} - {esource_url}")
+        
+        try:
+            # For ADS sources, only try direct download
+            if esource_type.startswith('ads_'):
+                pdf_status, pdf_filename, needs_verification = try_direct_download(session, esource_url)
+                if needs_verification:
+                    verification_urls.append((esource_type, esource_url))
+                if pdf_status:
+                    logger.debug(f"Successfully downloaded from {esource_type}")
+                    break
+                continue
+                
+            # For other sources, try the full download pipeline
+            pdf_status, pdf_filename, needs_verification = try_direct_download(session, esource_url)
+            if needs_verification:
+                verification_urls.append((esource_type, esource_url))
+            if pdf_status:
+                logger.debug(f"Successfully downloaded from {esource_type}")
                 break
+                
+            # If direct download fails and it's a publisher URL, try proxy
+            if not pdf_status and 'pub' in esource_type:
+                if prefs and prefs['proxy']['ssh_user'] != 'None' and prefs['proxy']['ssh_server'] != 'None':
+                    pdf_status = process_pdf_proxy(esource_url, pdf_filename,
+                                                   prefs['proxy']['ssh_user'],
+                                                   prefs['proxy']['ssh_server'],
+                                                   port=prefs['proxy']['ssh_port'])
+                    if pdf_status:
+                        logger.debug(f"Successfully downloaded via proxy from {esource_type}")
+                        break
+                        
+                # If proxy fails, try alternative sources
+                if not pdf_status and esource_type == 'pub_html':
+                    pdf_status, pdf_filename, needs_verification = try_html_to_pdf(session, esource_url)
+                    if needs_verification:
+                        verification_urls.append((esource_type, esource_url))
+                    if pdf_status:
+                        logger.debug(f"Successfully extracted PDF from HTML for {esource_type}")
+                        break
+                        
+        except Exception as e:
+            logger.debug(f"Download failed for {esource_type}: {str(e)}")
+            continue
+
+    if not pdf_status and verification_urls:
+        # If no PDF was downloaded but we found URLs requiring verification
+        # Open the first verification URL in default browser
+        verification_url = verification_urls[0][1]
+        logger.info(f"Opening verification URL in browser: {verification_url}")
+        subprocess.run(['open', verification_url])
+        return verification_url, False
 
     return pdf_filename, pdf_status
 
 
-def get_pdf_fromhtml(response):
-    """
-    guess the PDF link from the journal article html url, only works for some journals
-    """
-    url_html = response.url
+def try_direct_download(session, url):
+    """Try to download PDF directly from the URL"""
+    logger.debug(f"Attempting direct download: {url}")
     
-    url_pdf = url_html+'.pdf'
-    
-    tree = html.fromstring(response.content)
-    citation_pdf_url = tree.xpath("//meta[@name='citation_pdf_url']/@content")
-    if  len(citation_pdf_url) != 0:
-        url_pdf = citation_pdf_url[0]
+    try:
+        response = session.get(url, allow_redirects=True)
+        
+        # Check for human verification pages or redirects to login/authentication
+        needs_verification = False
+        if response.status_code in [403, 401]:  # Unauthorized or Forbidden
+            needs_verification = True
+        elif any(text in response.text.lower() for text in ['captcha', 'verification', 'robot', 'human', 'sign in', 'login', 'authenticate']):
+            needs_verification = True
+        elif 'oup.com' in response.url or 'academic.oup.com' in response.url:  # Special case for Oxford University Press
+            needs_verification = True
+            
+        if needs_verification:
+            logger.debug("Human verification detected")
+            return False, response.url, True  # Return the final URL after redirects
+            
+        # Create temporary file
+        fd, pdf_filename = tempfile.mkstemp(suffix='.pdf')
+        if response.status_code == 200:
+            os.fdopen(fd, 'wb').write(response.content)
+            
+            # Verify it's actually a PDF
+            if 'PDF document' in get_filetype(pdf_filename):
+                logger.debug(f"Successfully downloaded PDF from {url}")
+                return True, pdf_filename, False
+                
+        return False, pdf_filename, False
+        
+    except Exception as e:
+        logger.debug(f"Direct download failed: {str(e)}")
+        return False, '.null', False
 
-    if 'annualreviews.org' in url_html:
-        url_pdf = url_html.replace('/doi/', '/doi/pdf/')
 
-    if 'link.springer.com' in url_html:
-        url_pdf = url_html.replace(
-            'book', 'content/pdf').replace('article', 'content/pdf')+'.pdf'        
+def try_html_to_pdf(session, url):
+    """Try to extract PDF URL from HTML page and download"""
+    logger.debug(f"Attempting HTML-to-PDF extraction: {url}")
     
-    return url_pdf
+    try:
+        response = session.get(url)
+        if response.status_code != 200:
+            return False, '.null', False
+            
+        # Check for verification pages or redirects to login/authentication
+        needs_verification = False
+        if response.status_code in [403, 401]:  # Unauthorized or Forbidden
+            needs_verification = True
+        elif any(text in response.text.lower() for text in ['captcha', 'verification', 'robot', 'human', 'sign in', 'login', 'authenticate']):
+            needs_verification = True
+        elif 'oup.com' in response.url or 'academic.oup.com' in response.url:  # Special case for Oxford University Press
+            needs_verification = True
+            
+        if needs_verification:
+            logger.debug("Human verification detected on HTML page")
+            return False, response.url, True
+            
+        # Try multiple methods to find PDF link
+        pdf_url = None
+        
+        # Method 1: Check meta tags
+        tree = html.fromstring(response.content)
+        meta_pdf_urls = tree.xpath("//meta[@name='citation_pdf_url']/@content")
+        if meta_pdf_urls:
+            pdf_url = meta_pdf_urls[0]
+            
+        # Method 2: Look for PDF links in specific patterns
+        if not pdf_url:
+            if 'annualreviews.org' in url:
+                pdf_url = url.replace('/doi/', '/doi/pdf/')
+            elif 'link.springer.com' in url:
+                pdf_url = url.replace('book', 'content/pdf').replace('article', 'content/pdf')+'.pdf'
+            elif 'science.org' in url or 'sciencemag.org' in url:
+                pdf_url = url + '/pdf'
+            elif 'academic.oup.com' in url:
+                pdf_url = url.replace('/abstract/', '/pdf/')
+            else:
+                # Generic attempt
+                pdf_url = url + '.pdf'
+        
+        if pdf_url:
+            status, filename, needs_verification = try_direct_download(session, pdf_url)
+            return status, filename, needs_verification
+            
+        return False, '.null', False
+        
+    except Exception as e:
+        logger.debug(f"HTML-to-PDF extraction failed: {str(e)}")
+        return False, '.null', False
 
 
 def process_pdf_proxy(pdf_url, pdf_filename, user, server, port=22):

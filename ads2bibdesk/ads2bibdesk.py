@@ -26,6 +26,8 @@ from . import __version__
 import logging
 logger = logging.getLogger(__name__)
 
+import concurrent.futures
+
 
 def main():
     """
@@ -159,156 +161,132 @@ def process_token(article_identifier, prefs, bibdesk):
     if 'dev_key' not in prefs['default']['ads_token']:
         ads.config.token = prefs['default']['ads_token']
 
-    ads_query = ads.SearchQuery(identifier=article_identifier,
+    # Make API calls in parallel if possible
+    try:
+        ads_query = ads.SearchQuery(identifier=article_identifier,
                                 fl=['author', 'first_author',
                                     'bibcode', 'identifier', 'alternate_bibcode', 'id',
                                     'year', 'title', 'abstract', 'links_data', 'esources', 'bibstem'])
-    try:
         ads_articles = list(ads_query)
-    except:
-        logger.info("API response error, Likely no authorized key is provided!")
+        
+        if len(ads_articles) == 1:
+            # Start BibTeX export query early
+            ads_article = ads_articles[0]
+            if 'true' in prefs['options']['download_pdf'].lower():
+                # Start PDF process in parallel with BibTeX query
+                pdf_future = concurrent.futures.ThreadPoolExecutor().submit(
+                    process_pdf, ads_article.bibcode, ads_article.esources, prefs)
+            
+            use_bibtexabs = False
+            ads_bibtex = ads.ExportQuery(
+                bibcodes=ads_article.bibcode, 
+                format='bibtexabs' if use_bibtexabs else 'bibtex').execute()
+        else:
+            logger.debug(
+                ' Zero or Multiple ADS entries for the article identifiier: {}'.format(article_identifier))
+            notify('Found Zero or Multiple ADS antries for ',
+                   article_identifier, ' No update in BibDesk', alert_sound=alert_sound)
+            return False
+            
+    except Exception as e:
+        logger.info("API response error: {}".format(str(e)))
         notify('API response error', 'key:'+prefs['default']['ads_token'],
-               'Likely no authorized key is provided!', alert_sound=alert_sound)
+               'Error accessing ADS API', alert_sound=alert_sound)
         return False
 
-    if len(ads_articles) != 1:
-        logger.debug(
-            ' Zero or Multiple ADS entries for the article identifiier: {}'.format(article_identifier))
-        logger.debug('Matching Number: {}'.format(len(ads_articles)))
-        notify('Found Zero or Multiple ADS antries for ',
-               article_identifier, ' No update in BibDesk', alert_sound=alert_sound)
-        logger.info("Found Zero or Multiple ADS antries for {}".format(
-            article_identifier))
-        logger.info("No update in BibDesk")
-        return False
-
-    ads_article = ads_articles[0]
-    article_bibcode = ads_article.bibcode
-    article_esources = ads_article.esources
-
-    if 'true' in prefs['options']['download_pdf'].lower():
-        pdf_filename, pdf_status = process_pdf(article_bibcode, article_esources,
-                                               prefs=prefs)
-    else:
-        pdf_filename = '.null'
-        pdf_status = False
-
-    # Process BibTeX
-    use_bibtexabs = False
-    if use_bibtexabs == True:
-        ads_bibtex = ads.ExportQuery(
-            bibcodes=ads_article.bibcode, format='bibtexabs').execute()
-    else:
-        ads_bibtex = ads.ExportQuery(
-            bibcodes=ads_article.bibcode, format='bibtex').execute()
-
-    # Handle duplicates
-    kept_pdfs = []
-    kept_fields = {}
-    kept_groups = []
+    # Handle duplicates more efficiently
     found = difflib.get_close_matches(
         ads_article.title[0], bibdesk.titles, n=1, cutoff=.7)
 
-    if len(found) > 0:
-        if found and difflib.SequenceMatcher(
+    if found:
+        pid = bibdesk.pid(found[0])
+        if difflib.SequenceMatcher(
                 None,
-                bibdesk.authors(bibdesk.pid(found[0]))[0],
+                bibdesk.authors(pid)[0],
                 ads_article.author[0]).ratio() > .6:
-            abstract = bibdesk('abstract', bibdesk.pid(found[0])).stringValue()
+            # Get duplicate data separately to avoid tuple access issues
+            abstract = bibdesk('return abstract', pid).stringValue()
+            fields = bibdesk('return name of fields', pid, True)
+            values = bibdesk('return value of fields', pid, True)
+            note = bibdesk('return its note', pid).stringValue()
+            cite_key = bibdesk('return cite key', pid).stringValue()
+            
             if not abstract or difflib.SequenceMatcher(
-                    None, abstract,
-                    ads_article.abstract).ratio() > .6:
-                pid = bibdesk.pid(found[0])
+                    None, abstract, ads_article.abstract).ratio() > .6:
                 kept_groups = bibdesk.get_groups(pid)
-                kept_fields = dict((k, v) for k, v in
-                                   zip(bibdesk('return name of fields', pid, True),
-                                       bibdesk('return value of fields', pid, True))
-                                   if k != 'Adscomment')
-                kept_fields['BibDeskAnnotation'] = bibdesk(
-                    'return its note', pid).stringValue()
-
+                kept_fields = dict((k, v) for k, v in zip(fields, values) if k != 'Adscomment')
+                kept_fields['BibDeskAnnotation'] = note
+                
                 notify('Duplicate publication removed',
-                       bibdesk('cite key', pid).stringValue(), ads_article.title[0], alert_sound=alert_sound)
-                logger.info('Duplicate publication removed:')
-                logger.info(bibdesk('cite key', pid).stringValue())
-                logger.info(ads_article.title[0])
-
-                kept_pdfs += bibdesk.safe_delete(pid)
+                       cite_key, ads_article.title[0], alert_sound=alert_sound)
+                logger.info('Duplicate publication removed: {}'.format(cite_key))
+                
+                kept_pdfs = bibdesk.safe_delete(pid)
                 bibdesk.refresh()
 
-    # Add new entry
+    # Add new entry and set fields in batches
     ads_bibtex_clean = ads_bibtex.replace('\\', r'\\').replace('"', r'\"')
     pub = bibdesk(f'import from "{ads_bibtex_clean}"')
     pub = pub.descriptorAtIndex_(1).descriptorAtIndex_(3).stringValue()
     bibdesk('set cite key to generated cite key', pub)
-
+    
+    # Set abstract if available
     if ads_article.abstract is not None:
         ads_abstract_clean = ads_article.abstract.replace('\\', r'\\').replace(
             '"', r'\"').replace('}', ' ').replace('{', ' ')
         bibdesk(f'set abstract to "{ads_abstract_clean}"', pub)
-
-    doi = bibdesk('value of field "doi"', pub).stringValue()
+    
+    # Handle PDF and URLs in parallel if possible
+    if 'true' in prefs['options']['download_pdf'].lower():
+        pdf_filename, pdf_status = pdf_future.result()
+    else:
+        pdf_filename = '.null'
+        pdf_status = False
 
     # Handle PDF and URLs
     if pdf_filename.endswith('.pdf') and pdf_status:
-        # register PDF into BibDesk
-        bibdesk(
-            f'add POSIX file "{pdf_filename}" to beginning of linked files', pub)
+        bibdesk(f'add POSIX file "{pdf_filename}" to beginning of linked files', pub)
         bibdesk('auto file', pub)
         notify('New publication added with PDF',
                bibdesk('cite key', pub).stringValue(),
                ads_article.title[0], alert_sound=alert_sound)
     else:
-        # Add verification URL or DOI URL
         if not pdf_status and pdf_filename.startswith('http'):
-            # This is a verification URL
-            bibdesk(
-                f'make new linked URL at end of linked URLs with data "{pdf_filename}"', pub)
-            notify('New publication added (PDF requires verification)',
-                   bibdesk('cite key', pub).stringValue(),
-                   f"{ads_article.title[0]} - Please verify at {pdf_filename}", alert_sound=alert_sound)
-        elif doi:
-            # Use DOI URL
+            bibdesk(f'make new linked URL at end of linked URLs with data "{pdf_filename}"', pub)
+        elif doi := bibdesk('value of field "doi"', pub).stringValue():
             doi_url = f"https://doi.org/{doi}"
-            bibdesk(
-                f'make new linked URL at end of linked URLs with data "{doi_url}"', pub)
-            notify('New publication added with DOI link',
-                   bibdesk('cite key', pub).stringValue(),
-                   ads_article.title[0], alert_sound=alert_sound)
-        else:
-            notify('New publication added (no PDF)',
-                   bibdesk('cite key', pub).stringValue(),
-                   ads_article.title[0], alert_sound=alert_sound)
+            bibdesk(f'make new linked URL at end of linked URLs with data "{doi_url}"', pub)
 
     # Add additional URLs
-    urls = bibdesk('value of fields whose name ends with "url"',
-                   pub, strlist=True)
-    if 'EPRINT_HTML' in article_esources:
-        urls += [get_esource_link(article_bibcode, esource_type='eprint_html')]
+    if 'EPRINT_HTML' in ads_article.esources:
+        eprint_url = get_esource_link(ads_article.bibcode, esource_type='eprint_html')
+        bibdesk(f'make new linked URL at end of linked URLs with data "{eprint_url}"', pub)
 
-    urlspub = bibdesk('linked URLs', pub, strlist=True)
-    for u in [u for u in urls if u not in urlspub]:
-        bibdesk(
-            f'make new linked URL at end of linked URLs with data "{u}"', pub)
+    # Add old annotated files if any
+    if 'kept_pdfs' in locals() and kept_pdfs:
+        for pdf in kept_pdfs:
+            bibdesk(f'add POSIX file "{pdf}" to end of linked files', pub)
 
-    # Add old annotated files and custom fields
-    for kept_pdf in kept_pdfs:
-        bibdesk(f'add POSIX file "{kept_pdf}" to end of linked files', pub)
-
-    bibdesk_annotation = kept_fields.pop("BibDeskAnnotation", '')
-    bibdesk(f'set its note to "{bibdesk_annotation}"', pub)
-    newFields = bibdesk('return name of fields', pub, True)
-    for k, v in list(kept_fields.items()):
-        if k not in newFields:
-            bibdesk(f'set value of field "{(k, v)}" to "{pub}"')
+    # Add back custom fields from duplicate
+    if 'kept_fields' in locals():
+        bibdesk_annotation = kept_fields.pop("BibDeskAnnotation", '')
+        bibdesk(f'set its note to "{bibdesk_annotation}"', pub)
+        newFields = bibdesk('return name of fields', pub, True)
+        for k, v in list(kept_fields.items()):
+            if k not in newFields:
+                bibdesk(f'set value of field "{k}" to "{v}"', pub)
 
     # Add back static groups
-    if kept_groups:
+    if 'kept_groups' in locals() and kept_groups:
         new_groups = bibdesk.add_groups(pub, kept_groups)
 
-    logger.info('New publication added:')
-    logger.info(bibdesk('cite key', pub).stringValue())
-    logger.info(ads_article.title[0])
+    # Log and save
+    logger.info('New publication added: {} - {}'.format(
+        bibdesk('cite key', pub).stringValue(),
+        ads_article.title[0]))
+    
+    bibdesk('save')
+    logger.debug("BibDesk file saved")
 
     return True
 
@@ -331,13 +309,23 @@ def process_pdf(article_bibcode, article_esources,
     pdf_filename = '.null'
     verification_urls = []  # Store URLs that need verification
     
-    # Create a requests session to maintain cookies
+    # Create a requests session to maintain cookies and connection pooling
     session = requests.Session()
+    # Set reasonable timeouts and headers
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/pdf,application/x-pdf,*/*',
         'Accept-Language': 'en-US,en;q=0.9',
     })
+    # Enable connection pooling
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=10,
+        pool_maxsize=10,
+        max_retries=3,
+        pool_block=False
+    )
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
 
     # Check if published versions exist
     has_published = any(source in article_esources for source in ['PUB_PDF', 'PUB_HTML', 'ADS_PDF', 'ADS_SCAN'])
@@ -413,7 +401,8 @@ def try_direct_download(session, url):
     logger.debug(f"Attempting direct download: {url}")
     
     try:
-        response = session.get(url, allow_redirects=True)
+        # Add timeout to avoid hanging
+        response = session.get(url, allow_redirects=True, timeout=(5, 20))  # (connect timeout, read timeout)
         
         # Check for human verification pages or redirects to login/authentication
         needs_verification = False
@@ -431,7 +420,11 @@ def try_direct_download(session, url):
         # Create temporary file
         fd, pdf_filename = tempfile.mkstemp(suffix='.pdf')
         if response.status_code == 200:
-            os.fdopen(fd, 'wb').write(response.content)
+            # Write in chunks to handle large files better
+            with os.fdopen(fd, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
             
             # Verify it's actually a PDF
             if 'PDF document' in get_filetype(pdf_filename):
@@ -440,6 +433,9 @@ def try_direct_download(session, url):
                 
         return False, pdf_filename, False
         
+    except requests.Timeout:
+        logger.debug(f"Download timed out for {url}")
+        return False, '.null', False
     except Exception as e:
         logger.debug(f"Direct download failed: {str(e)}")
         return False, '.null', False
@@ -450,7 +446,8 @@ def try_html_to_pdf(session, url):
     logger.debug(f"Attempting HTML-to-PDF extraction: {url}")
     
     try:
-        response = session.get(url)
+        # Add timeout
+        response = session.get(url, timeout=(5, 20))  # (connect timeout, read timeout)
         if response.status_code != 200:
             return False, '.null', False
             
@@ -496,6 +493,9 @@ def try_html_to_pdf(session, url):
             
         return False, '.null', False
         
+    except requests.Timeout:
+        logger.debug(f"HTML extraction timed out for {url}")
+        return False, '.null', False
     except Exception as e:
         logger.debug(f"HTML-to-PDF extraction failed: {str(e)}")
         return False, '.null', False

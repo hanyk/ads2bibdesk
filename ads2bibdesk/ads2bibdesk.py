@@ -232,8 +232,14 @@ def process_token(article_identifier, prefs, bibdesk):
     
     # Set abstract if available
     if ads_article.abstract is not None:
-        ads_abstract_clean = ads_article.abstract.replace('\\', r'\\').replace(
-            '"', r'\"').replace('}', ' ').replace('{', ' ')
+        # Escape essential BibTeX characters and preserve LaTeX
+        ads_abstract_clean = (
+            ads_article.abstract
+            .replace('\\', r'\\\\')  # Escape backslashes for AppleScript
+            .replace('"', r'\\"')    # Escape quotes for AppleScript
+            .replace('%', r'\\%')    # Escape percent signs
+        )
+        # Use triple quotes in AppleScript for safety
         bibdesk(f'set abstract to "{ads_abstract_clean}"', pub)
     
     # Handle PDF and URLs in parallel if possible
